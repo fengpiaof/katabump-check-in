@@ -1,0 +1,4 @@
+DrissionPage==4.1.0.18
+curl-cffi>=0.7.0
+loguru>=0.7.2
+beautifulsoup4>=4.12.0
