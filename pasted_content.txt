@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Katabump 青龙/Alpine 稳定版 (v4.3 - Force Jump)
+
+核心修复：
+- 废除“跳过登录”的判断，解决“假登录”导致的死循环。
+- 逻辑改为：直接访问续期链接 -> 若被拦截到登录页 -> 强制登录 -> 再次访问续期链接。
+- 只有真正停留在续期页（edit页）时，才开始点 Renew。
+"""
+
+import os
+import io
+import json
+import time
+import zipfile
+import shutil
+import socket
+import datetime
+import requests
+from DrissionPage import ChromiumPage, ChromiumOptions
+
+# ==================== 青龙通知适配 ====================
+try:
+    from notify import send
+except Exception:
+    def send(title, content):
+        print(f"【通知预览】{title}\n{content}")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+EXT_DIR = os.path.join(BASE_DIR, "extensions")
+os.makedirs(EXT_DIR, exist_ok=True)
+
+notify_msg = []
+
+def log(message: str):
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {message}", flush=True)
+    notify_msg.append(message)
+
+def _find_manifest_dir(root_dir: str):
+    if not root_dir or not os.path.exists(root_dir):
+        return None
+    for root, _, files in os.walk(root_dir):
+        if "manifest.json" in files:
+            return os.path.abspath(root)
+    return None
+
+def _read_manifest_info(ext_dir: str):
+    try:
+        mf = os.path.join(ext_dir, "manifest.json")
+        with open(mf, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("name", ""), data.get("version", "")
+    except Exception:
+        return "", ""
+
+# ==================== 插件下载逻辑 ====================
+def _crx_to_zip_bytes(crx_bytes: bytes) -> bytes:
+    sig = b"PK\x03\x04"
+    idx = crx_bytes.find(sig)
+    return crx_bytes[idx:] if idx != -1 else b""
+
+def download_silk():
+    extract_root = os.path.join(EXT_DIR, "silk_ext")
+    existed = _find_manifest_dir(extract_root)
+    if existed:
+        name, ver = _read_manifest_info(existed)
+        log(f"✅ [插件1] Silk 已存在: {existed} | {name} {ver}".strip())
+        return existed
+
+    log("⬇️ [插件1] 正在下载 Silk ...")
+    url = ("https://clients2.google.com/service/update2/crx?"
+           "response=redirect&prodversion=122.0&acceptformat=crx2,crx3&"
+           "x=id%3Dajhmfdgkijocedmfjonnpjfojldioehi%26uc")
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+        if resp.status_code != 200: return None
+        payload = _crx_to_zip_bytes(resp.content)
+        if not payload: return None
+        os.makedirs(extract_root, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+            zf.extractall(extract_root)
+        return _find_manifest_dir(extract_root)
+    except Exception:
+        return None
+
+def download_buyi06_cf():
+    extract_root = os.path.join(EXT_DIR, "buyi06_cf_root")
+    existed = _find_manifest_dir(extract_root)
+    if existed:
+        name, ver = _read_manifest_info(existed)
+        log(f"✅ [插件2] buyi06/cf 已存在: {existed} | {name} {ver}".strip())
+        return existed
+
+    log("⬇️ [插件2] 正在下载 buyi06/cf ...")
+    url = "https://codeload.github.com/buyi06/cf/zip/refs/heads/master"
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+        if resp.status_code != 200: return None
+        os.makedirs(extract_root, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            zf.extractall(extract_root)
+        return _find_manifest_dir(extract_root)
+    except Exception:
+        return None
+
+# ==================== 浏览器配置 ====================
+def _pick_browser_path():
+    env_path = os.environ.get("KB_CHROME_PATH", "").strip()
+    if env_path and os.path.exists(env_path): return env_path
+    alpine = "/usr/bin/chromium-browser"
+    if os.path.exists(alpine): return alpine
+    return shutil.which("chromium") or shutil.which("chromium-browser")
+
+def _free_port():
+    s = socket.socket()
+    s.bind(('', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+def get_page():
+    browser_path = _pick_browser_path()
+    if not browser_path:
+        log("❌ 未找到浏览器路径，请安装 chromium")
+        exit(1)
+        
+    log(f"🔧 锁定浏览器路径: {browser_path}")
+    
+    silk = download_silk()
+    cf_ext = download_buyi06_cf()
+    
+    co = ChromiumOptions()
+    co.set_browser_path(browser_path)
+    co.set_argument('--headless=new') # 无头模式
+    co.set_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+    co.set_argument('--window-size=1920,1080')
+    co.set_argument('--no-sandbox')
+    co.set_argument('--disable-gpu')
+    co.set_argument('--disable-infobars')
+    co.set_argument('--disable-dev-shm-usage')
+    co.set_argument('--no-zygote')
+    co.set_argument('--disable-blink-features=AutomationControlled')
+    
+    if silk: co.add_extension(silk)
+    if cf_ext: co.add_extension(cf_ext)
+    
+    co.set_local_port(_free_port())
+    
+    return ChromiumPage(addr_or_opts=co)
+
+# ==================== 主逻辑 ====================
+def main():
+    KB_USER = os.environ.get("KB_EMAIL", "") 
+    KB_PWD = os.environ.get("KB_PASSWORD", "")
+    KB_RENEW_URL = os.environ.get("KB_RENEW_URL", "")
+
+    if not KB_USER or not KB_PWD or not KB_RENEW_URL:
+        log("❌ 变量缺失: KB_EMAIL / KB_PASSWORD / KB_RENEW_URL")
+        return
+
+    try:
+        page = get_page()
+    except Exception as e:
+        log(f"❌ 浏览器启动失败: {e}")
+        return
+    
+    MAX_RETRIES = 5
+    
+    for i in range(1, MAX_RETRIES + 1):
+        try:
+            log(f"🚀 开始执行... (第 {i}/{MAX_RETRIES} 次)")
+            
+            # --- 步骤 1: 直接冲向续期 URL ---
+            # 不再先访问 /login 判断，而是直接访问目标，让服务器决定是否拦截
+            log(f"➡️ 直接访问目标链接: {KB_RENEW_URL}")
+            page.get(KB_RENEW_URL)
+            time.sleep(5)
+            
+            # --- 步骤 2: 登录拦截处理 ---
+            # 如果当前 URL 变成了 login，或者页面里有 email 输入框，说明 Session 无效，必须登录
+            if "login" in page.url or page.ele('css:input[name="email"]'):
+                log("🚧 目标链接将我们重定向到了登录页，开始登录...")
+                
+                ele_email = page.ele('css:input[name="email"]', timeout=3)
+                ele_pass = page.ele('css:input[name="password"]', timeout=3)
+                btn_submit = page.ele('css:button[type="submit"]', timeout=3)
+
+                if ele_email and ele_pass and btn_submit:
+                    ele_email.input(KB_USER)
+                    ele_pass.input(KB_PWD)
+                    time.sleep(1)
+                    btn_submit.click()
+                    log("✅ 提交了登录表单，等待跳转...")
+                    time.sleep(5) # 等待登录完成
+                else:
+                    log("❌ 到了登录页但找不到输入框 (可能被 CF 验证码拦截)")
+                    # 这里不 continue，让它往下走，看看能不能刷新出来
+            
+            # --- 步骤 3: 登录后再次确认位置 ---
+            # 登录成功后，有时会停在 /dashboard，而不是我们刚才想去的 /servers/edit
+            # 所以这里必须强制检查，如果不在 edit 页，再跳一次
+            if "edit" not in page.url:
+                log(f"🔄 登录完成，再次强制跳转到: {KB_RENEW_URL}")
+                page.get(KB_RENEW_URL)
+                time.sleep(5)
+
+            # 最终检查：还在登录页吗？
+            if "login" in page.url:
+                log("⚠️ 尝试登录并跳转后，依然在登录页，重试本次循环...")
+                continue
+                
+            # --- 步骤 4: 查找并点击 Renew ---
+            log("🔎 已到达目标页，查找 Renew 按钮...")
+            renew_btn = page.ele('css:button[data-bs-toggle="modal"][data-bs-target="#renew-modal"]', timeout=10)
+            
+            if not renew_btn:
+                log("⚠️ 未找到按钮，尝试文本查找...")
+                renew_btn = page.ele('text:Renew', timeout=5)
+                if not renew_btn:
+                    log("❌ 彻底未找到 Renew 按钮 (可能 URL 不对或服务器已过期)，重试")
+                    continue
+            
+            # 滚动并点击
+            try:
+                renew_btn.scroll.to_see()
+                time.sleep(1)
+            except Exception:
+                pass
+
+            renew_btn.click()
+            log("✅ 点击 Renew，等待弹窗...")
+            time.sleep(3) 
+
+            # --- 步骤 5: 等待 Turnstile ---
+            max_wait_ts = 60
+            start_ts = time.time()
+            cf_success = False
+            
+            log("⏳ 等待 Turnstile 验证...")
+            
+            while time.time() - start_ts < max_wait_ts:
+                try:
+                    resp_ele = page.ele('css:input[name="cf-turnstile-response"]', timeout=1)
+                    if resp_ele:
+                        val = resp_ele.attr("value")
+                        if val and len(val) > 20:
+                            log("✅ Turnstile 验证通过")
+                            cf_success = True
+                            break
+                    if page.ele('text:Error verifying Turnstile'):
+                        break
+                except Exception:
+                    pass
+                time.sleep(2)
+                print(".", end="", flush=True)
+
+            print("") 
+
+            if not cf_success:
+                log("⚠️ 验证码超时，刷新重试")
+                page.refresh()
+                continue
+            
+            # --- 步骤 6: 提交 ---
+            confirm_btn = page.ele('css:#renew-modal button[type="submit"]', timeout=5)
+            if confirm_btn:
+                confirm_btn.click()
+                log("✅ 已点击提交")
+                time.sleep(5)
+                
+                html_lower = page.html.lower()
+                if "success" in html_lower or "renewed" in html_lower:
+                    log("🎉 续期成功！")
+                    send("KataBump 续期", f"账号 {KB_USER} 续期成功。")
+                    break
+                else:
+                    log("❓ 未检测到成功标识，但流程已走完。")
+                    break
+            else:
+                log("❌ 找不到确认按钮")
+                continue
+
+        except Exception as e:
+            log(f"❌ 运行异常: {e}")
+            time.sleep(3)
+
+    log("🏁 脚本结束")
+    page.quit()
+
+if __name__ == "__main__":
+    main()

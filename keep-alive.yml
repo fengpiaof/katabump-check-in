@@ -1,0 +1,30 @@
+name: Keep Alive
+
+on:
+  schedule:
+    # 每 50 天执行一次，防止 GitHub 禁用定时任务
+    - cron: '0 0 1,15 * *'
+  
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Keep workflow alive
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          # 更新时间戳文件
+          echo "Last keep-alive: $(date -u)" > .github/.keep-alive
+          
+          git add .github/.keep-alive
+          git diff --quiet && git diff --staged --quiet || git commit -m "chore: keep workflow alive [skip ci]"
+          git push
